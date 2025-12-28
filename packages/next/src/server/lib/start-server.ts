@@ -373,6 +373,21 @@ export async function startServer(
           logBundler: isDev,
         })
 
+        // Print "Ready" immediately for fast perceived startup
+        // Requests will wait via handlersPromise until init completes
+        const startServerProcessDuration =
+          performance.mark('next-start-end') &&
+          performance.measure(
+            'next-start-duration',
+            'next-start',
+            'next-start-end'
+          ).duration
+        const formatDurationText =
+          startServerProcessDuration > 2000
+            ? `${Math.round(startServerProcessDuration / 100) / 10}s`
+            : `${Math.round(startServerProcessDuration)}ms`
+        Log.event(`Ready in ${formatDurationText}`)
+
         let cleanupStarted = false
         let closeUpgraded: (() => void) | null = null
         const cleanup = () => {
@@ -457,21 +472,7 @@ export async function startServer(
         nextServer = initResult.server
         closeUpgraded = initResult.closeUpgraded
 
-        const startServerProcessDuration =
-          performance.mark('next-start-end') &&
-          performance.measure(
-            'next-start-duration',
-            'next-start',
-            'next-start-end'
-          ).duration
-
         handlersReady()
-        const formatDurationText =
-          startServerProcessDuration > 2000
-            ? `${Math.round(startServerProcessDuration / 100) / 10}s`
-            : `${Math.round(startServerProcessDuration)}ms`
-
-        Log.event(`Ready in ${formatDurationText}`)
 
         if (process.env.TURBOPACK && isDev) {
           await validateTurboNextConfig({

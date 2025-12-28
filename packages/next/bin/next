@@ -1,5 +1,13 @@
 #!/bin/sh
-DIR="$(dirname "$0")"
+# Resolve symlinks to get the real directory (handles node_modules/.bin symlinks)
+SCRIPT="$0"
+while [ -L "$SCRIPT" ]; do
+  DIR="$(dirname "$SCRIPT")"
+  SCRIPT="$(readlink "$SCRIPT")"
+  # Handle relative symlinks
+  [ "${SCRIPT#/}" = "$SCRIPT" ] && SCRIPT="$DIR/$SCRIPT"
+done
+DIR="$(dirname "$SCRIPT")"
 
 # Development: local binary
 [ -x "$DIR/next-native" ] && exec "$DIR/next-native" "$@"

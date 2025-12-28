@@ -17,8 +17,11 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     // Get the directory where this binary lives (packages/next/bin/)
+    // Use canonicalize to resolve symlinks (e.g., node_modules/.bin/next -> packages/next/bin/next)
     let bin_dir = env::current_exe()
         .expect("failed to get executable path")
+        .canonicalize()
+        .expect("failed to canonicalize executable path")
         .parent()
         .expect("failed to get parent directory")
         .to_path_buf();
@@ -40,6 +43,18 @@ fn main() {
 
         if !node_options.is_empty() {
             cmd.env("NODE_OPTIONS", &node_options);
+        }
+
+        // Dev-specific environment variables
+        if args.get(1).map(|s| s.as_str()) == Some("dev") {
+            // Set development env vars (previously done by cross-env in pnpm scripts)
+            // This allows the Rust binary to handle the full restart loop
+            if env::var("NEXT_PRIVATE_LOCAL_DEV").is_err() {
+                cmd.env("NEXT_PRIVATE_LOCAL_DEV", "1");
+            }
+            if env::var("NEXT_TELEMETRY_DISABLED").is_err() {
+                cmd.env("NEXT_TELEMETRY_DISABLED", "1");
+            }
         }
 
         // macOS workaround: limit file watchers to avoid slow close
