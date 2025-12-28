@@ -68,3 +68,8 @@ test-timings.json
 .claude/settings.local.json
 .claude/plans/
 .claude/todos.json
+
+# Native CLI binaries (shell scripts next and next.cmd are committed)
+packages/next/bin/next-native
+packages/next/bin/next-native.exe
+packages/next/bin/next-cli-*
