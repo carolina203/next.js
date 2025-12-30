@@ -109,7 +109,7 @@ const renames = [
 module.exports = {
   commentHeading: 'Stats from current PR',
   commentReleaseHeading: 'Stats from current release',
-  appBuildCommand: 'NEXT_TELEMETRY_DISABLED=1 pnpm next build',
+  appBuildCommand: 'NEXT_TELEMETRY_DISABLED=1 pnpm next build --webpack',
   appStartCommand: 'NEXT_TELEMETRY_DISABLED=1 pnpm next start --port $PORT',
   appDevCommand: 'NEXT_TELEMETRY_DISABLED=1 pnpm next dev --port $PORT',
   measureDevBoot: true,
@@ -126,6 +126,7 @@ module.exports = {
           content: `
             module.exports = {
               generateBuildId: () => 'BUILD_ID',
+              turbopack: {},
               webpack(config) {
                 config.optimization.minimize = false
                 config.optimization.minimizer = undefined
@@ -142,7 +143,8 @@ module.exports = {
           path: 'next.config.js',
           content: `
           module.exports = {
-              generateBuildId: () => 'BUILD_ID'
+              generateBuildId: () => 'BUILD_ID',
+              turbopack: {},
             }
           `,
         },

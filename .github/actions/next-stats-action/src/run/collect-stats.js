@@ -1,15 +1,52 @@
 const path = require('path')
 const net = require('net')
 const fs = require('fs/promises')
+const { existsSync } = require('fs')
 const getPort = require('get-port')
 const fetch = require('node-fetch')
 const glob = require('../util/glob')
 const gzipSize = require('gzip-size')
 const logger = require('../util/logger')
+const exec = require('../util/exec')
 const { spawn } = require('../util/exec')
 const { parse: urlParse } = require('url')
 const benchmarkUrl = require('./benchmark-url')
 const { statsAppDir, diffingDir, benchTitle } = require('../constants')
+
+// Number of iterations for timing benchmarks to get stable median
+const BENCHMARK_ITERATIONS = 5
+
+// Calculate median of an array of numbers
+function median(arr) {
+  if (arr.length === 0) return null
+  const sorted = [...arr].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+}
+
+// Calculate stats summary for an array of numbers
+function calcStats(arr) {
+  if (arr.length === 0) return null
+  const sorted = [...arr].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  const med =
+    sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+  const min = sorted[0]
+  const max = sorted[sorted.length - 1]
+  const mean = arr.reduce((a, b) => a + b, 0) / arr.length
+  const variance =
+    arr.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / arr.length
+  const stddev = Math.sqrt(variance)
+  const cv = mean > 0 ? (stddev / mean) * 100 : 0 // coefficient of variation as %
+  return {
+    median: med,
+    min,
+    max,
+    mean: Math.round(mean),
+    stddev: Math.round(stddev),
+    cv: Math.round(cv),
+  }
+}
 
 // Check if a port is accepting TCP connections
 function checkPort(port, timeout = 100) {
@@ -104,6 +141,62 @@ async function benchmarkDevBoot(appDevCommand, curDir, port, cleanBuild) {
   }
 }
 
+// Run multiple iterations of dev boot benchmark and return median times
+async function benchmarkDevBootWithIterations(
+  appDevCommand,
+  curDir,
+  port,
+  cleanBuild,
+  label
+) {
+  const listenTimes = []
+  const readyTimes = []
+
+  for (let i = 0; i < BENCHMARK_ITERATIONS; i++) {
+    // For cold start benchmarks, clean before EVERY iteration to get true cold times
+    logger(`  ${label} iteration ${i + 1}/${BENCHMARK_ITERATIONS}...`)
+
+    const result = await benchmarkDevBoot(
+      appDevCommand,
+      curDir,
+      port,
+      cleanBuild
+    )
+
+    if (result.listenTime !== null) {
+      listenTimes.push(result.listenTime)
+      logger(`    Boot: ${result.listenTime}ms`)
+    }
+    if (result.readyTime !== null) {
+      readyTimes.push(result.readyTime)
+      logger(`    Ready: ${result.readyTime}ms`)
+    }
+
+    // Small delay between iterations to let system settle
+    await new Promise((r) => setTimeout(r, 500))
+  }
+
+  const listenStats = calcStats(listenTimes)
+  const readyStats = calcStats(readyTimes)
+
+  // Log detailed stats for debugging
+  if (listenStats) {
+    logger(
+      `  ${label} Boot: median=${listenStats.median}ms, range=${listenStats.min}-${listenStats.max}ms, CV=${listenStats.cv}%`
+    )
+  }
+  if (readyStats) {
+    logger(
+      `  ${label} Ready: median=${readyStats.median}ms, range=${readyStats.min}-${readyStats.max}ms, CV=${readyStats.cv}%`
+    )
+  }
+
+  return {
+    listenTime: listenStats?.median ?? null,
+    readyTime: readyStats?.median ?? null,
+  }
+}
+
 async function defaultGetRequiredFiles(nextAppDir, fileName) {
   return [fileName]
 }
@@ -111,7 +204,10 @@ async function defaultGetRequiredFiles(nextAppDir, fileName) {
 module.exports = async function collectStats(
   runConfig = {},
   statsConfig = {},
-  fromDiff = false
+  fromDiff = false,
+  bundlerSuffix = null,
+  benchmarkOnly = false,
+  bundlerFilter = null
 ) {
   const stats = {
     [benchTitle]: {},
@@ -121,6 +217,11 @@ module.exports = async function collectStats(
   }
   const curDir = fromDiff ? diffingDir : statsAppDir
 
+  // If bundlerSuffix is provided, we're collecting file sizes only (skip benchmarks)
+  // If benchmarkOnly is true, we're running benchmarks only (skip file sizes)
+  const collectFileSizes = !benchmarkOnly
+  const runBenchmarks = !bundlerSuffix
+
   const hasPagesToFetch =
     Array.isArray(runConfig.pagesToFetch) && runConfig.pagesToFetch.length > 0
 
@@ -128,12 +229,77 @@ module.exports = async function collectStats(
     Array.isArray(runConfig.pagesToBench) && runConfig.pagesToBench.length > 0
 
   // Run production start benchmark FIRST (before dev benchmark which cleans .next)
+  // Only run benchmarks when not collecting bundler-specific file sizes
   if (
+    runBenchmarks &&
     !fromDiff &&
     statsConfig.appStartCommand &&
     (hasPagesToFetch || hasPagesToBench)
   ) {
     const port = await getPort()
+    const readyTimes = []
+
+    // Helper to run a single production start and measure time
+    async function runProdStartTiming() {
+      const startTime = Date.now()
+      const child = spawn(statsConfig.appStartCommand, {
+        cwd: curDir,
+        env: {
+          PORT: port,
+        },
+        stdio: 'pipe',
+      })
+
+      let serverReadyResolve
+      let serverReadyResolved = false
+      const serverReadyPromise = new Promise((resolve) => {
+        serverReadyResolve = resolve
+      })
+
+      child.stdout.on('data', (data) => {
+        if (data.toString().includes('- Local:') && !serverReadyResolved) {
+          serverReadyResolved = true
+          serverReadyResolve()
+        }
+      })
+
+      child.on('exit', () => {
+        if (!serverReadyResolved) {
+          serverReadyResolve()
+          serverReadyResolved = true
+        }
+      })
+
+      await serverReadyPromise
+      const readyTime = Date.now() - startTime
+      child.kill()
+      await new Promise((r) => setTimeout(r, 300)) // Let port release
+      return readyTime
+    }
+
+    // Run multiple timing iterations for stable median
+    logger(
+      `=== Production Start Benchmark (${BENCHMARK_ITERATIONS} iterations) ===`
+    )
+    for (let i = 0; i < BENCHMARK_ITERATIONS; i++) {
+      logger(`  Prod Start iteration ${i + 1}/${BENCHMARK_ITERATIONS}...`)
+      const readyTime = await runProdStartTiming()
+      readyTimes.push(readyTime)
+      logger(`    Ready: ${readyTime}ms`)
+    }
+
+    const readyStats = calcStats(readyTimes)
+    logger(
+      `  Prod Start: median=${readyStats.median}ms, range=${readyStats.min}-${readyStats.max}ms, CV=${readyStats.cv}%`
+    )
+
+    if (!orderedStats['General']) {
+      orderedStats['General'] = {}
+    }
+    orderedStats['General']['nextStartReadyDuration (ms)'] = readyStats.median
+
+    // Now run one more time to do page fetching/benchmarking
+    logger('=== Production Start for Page Fetching ===')
     const startTime = Date.now()
     const child = spawn(statsConfig.appStartCommand, {
       cwd: curDir,
@@ -169,11 +335,6 @@ module.exports = async function collectStats(
     })
 
     await serverReadyPromise
-    if (!orderedStats['General']) {
-      orderedStats['General'] = {}
-    }
-    orderedStats['General']['nextStartReadyDuration (ms)'] =
-      Date.now() - startTime
 
     if (exitCode !== null) {
       throw new Error(
@@ -234,114 +395,154 @@ module.exports = async function collectStats(
     child.kill()
   }
 
-  // Measure dev server boot time if configured (full matrix: cold/warm x listen/ready)
+  // Measure dev server boot time if configured
+  // Runs full matrix: (Turbopack + Webpack) x (Cold + Warm) x (Boot + Ready)
+  // Each timing uses median of BENCHMARK_ITERATIONS runs for stability
   // NOTE: This runs AFTER the production start benchmark because it cleans the .next directory
-  if (!fromDiff && statsConfig.appDevCommand && statsConfig.measureDevBoot) {
+  // Only run benchmarks when not collecting bundler-specific file sizes
+  if (
+    runBenchmarks &&
+    !fromDiff &&
+    statsConfig.appDevCommand &&
+    statsConfig.measureDevBoot
+  ) {
     const devPort = await getPort()
 
     if (!orderedStats['General']) {
       orderedStats['General'] = {}
     }
 
-    // 1. Cold start benchmark (clean .next directory)
-    logger('=== Cold Start Benchmark ===')
-    const coldResult = await benchmarkDevBoot(
-      statsConfig.appDevCommand,
-      curDir,
-      devPort,
-      true // clean build
-    )
+    // Run benchmarks for selected bundler(s)
+    // Default is now turbopack, so we need --webpack for webpack
+    const allBundlers = [
+      { name: 'Turbopack', flag: '', suffix: 'Turbo' },
+      { name: 'Webpack', flag: '--webpack', suffix: 'Webpack' },
+    ]
+    const bundlers = bundlerFilter
+      ? allBundlers.filter((b) => b.name.toLowerCase() === bundlerFilter)
+      : allBundlers
 
-    if (coldResult.listenTime !== null) {
-      orderedStats['General']['nextDevColdListenDuration (ms)'] =
-        coldResult.listenTime
-    }
-    if (coldResult.readyTime !== null) {
-      orderedStats['General']['nextDevColdReadyDuration (ms)'] =
-        coldResult.readyTime
-    }
+    for (const bundler of bundlers) {
+      logger(`\n=== ${bundler.name} Dev Server Benchmarks ===`)
 
-    // 2. Warm up bytecode cache by running server for ~10 seconds
-    if (coldResult.readyTime !== null) {
-      logger('=== Warming up bytecode cache (10s) ===')
-      const warmupChild = spawn(statsConfig.appDevCommand, {
-        cwd: curDir,
-        env: {
-          PORT: devPort,
-        },
-        stdio: 'pipe',
-      })
+      // Build the command with the bundler flag
+      const devCommand = bundler.flag
+        ? `${statsConfig.appDevCommand} ${bundler.flag}`
+        : statsConfig.appDevCommand
 
-      // Wait for server to be ready
-      await waitForHttp(devPort, 60000)
-
-      // Let it run for 10 seconds to warm bytecode cache
-      await new Promise((r) => setTimeout(r, 10000))
-
-      warmupChild.kill()
-
-      // Small delay to ensure clean shutdown
-      await new Promise((r) => setTimeout(r, 500))
-
-      // 3. Warm start benchmark (keep .next directory)
-      logger('=== Warm Start Benchmark ===')
-      const warmResult = await benchmarkDevBoot(
-        statsConfig.appDevCommand,
+      // 1. Cold start benchmark (clean .next directory, multiple iterations)
+      logger(
+        `=== ${bundler.name} Cold Start (${BENCHMARK_ITERATIONS} iterations) ===`
+      )
+      const coldResult = await benchmarkDevBootWithIterations(
+        devCommand,
         curDir,
         devPort,
-        false // keep build
+        true, // clean .next before each iteration
+        `${bundler.name} Cold`
       )
 
-      if (warmResult.listenTime !== null) {
-        orderedStats['General']['nextDevWarmListenDuration (ms)'] =
-          warmResult.listenTime
+      if (coldResult.listenTime !== null) {
+        orderedStats['General'][
+          `nextDevColdListenDuration${bundler.suffix} (ms)`
+        ] = coldResult.listenTime
       }
-      if (warmResult.readyTime !== null) {
-        orderedStats['General']['nextDevWarmReadyDuration (ms)'] =
-          warmResult.readyTime
+      if (coldResult.readyTime !== null) {
+        orderedStats['General'][
+          `nextDevColdReadyDuration${bundler.suffix} (ms)`
+        ] = coldResult.readyTime
       }
-    }
 
-    logger('=== Dev Boot Benchmark Complete ===')
-  }
+      // 2. Warm up bytecode cache by running server for ~10 seconds
+      if (coldResult.readyTime !== null) {
+        logger(`=== ${bundler.name} Warming up bytecode cache (10s) ===`)
+        const warmupChild = spawn(devCommand, {
+          cwd: curDir,
+          env: {
+            PORT: devPort,
+          },
+          stdio: 'pipe',
+        })
 
-  for (const fileGroup of runConfig.filesToTrack) {
-    const {
-      getRequiredFiles = defaultGetRequiredFiles,
-      name,
-      globs,
-    } = fileGroup
-    const groupStats = {}
-    const curFiles = new Set()
+        // Wait for server to be ready
+        await waitForHttp(devPort, 60000)
 
-    for (const pattern of globs) {
-      const results = await glob(pattern, { cwd: curDir, nodir: true })
-      results.forEach((result) => curFiles.add(result))
-    }
+        // Let it run for 10 seconds to warm bytecode cache
+        await new Promise((r) => setTimeout(r, 10000))
 
-    for (const file of curFiles) {
-      const fileKey = path.basename(file)
-      try {
-        let parsedSizeSum = 0
-        let gzipSizeSum = 0
-        for (const requiredFile of await getRequiredFiles(curDir, file)) {
-          const absPath = path.join(curDir, requiredFile)
-          const fileInfo = await fs.stat(absPath)
-          parsedSizeSum += fileInfo.size
-          gzipSizeSum += await gzipSize.file(absPath)
+        warmupChild.kill()
+
+        // Small delay to ensure clean shutdown
+        await new Promise((r) => setTimeout(r, 500))
+
+        // 3. Warm start benchmark (keep .next directory, multiple iterations)
+        logger(
+          `=== ${bundler.name} Warm Start (${BENCHMARK_ITERATIONS} iterations) ===`
+        )
+        const warmResult = await benchmarkDevBootWithIterations(
+          devCommand,
+          curDir,
+          devPort,
+          false, // keep build
+          `${bundler.name} Warm`
+        )
+
+        if (warmResult.listenTime !== null) {
+          orderedStats['General'][
+            `nextDevWarmListenDuration${bundler.suffix} (ms)`
+          ] = warmResult.listenTime
         }
-        groupStats[fileKey] = parsedSizeSum
-        groupStats[`${fileKey} gzip`] = gzipSizeSum
-      } catch (err) {
-        logger.error('Failed to get file stats', err)
+        if (warmResult.readyTime !== null) {
+          orderedStats['General'][
+            `nextDevWarmReadyDuration${bundler.suffix} (ms)`
+          ] = warmResult.readyTime
+        }
       }
     }
-    stats[name] = groupStats
+
+    logger('\n=== Dev Boot Benchmark Complete ===')
   }
 
-  for (const fileGroup of runConfig.filesToTrack) {
-    const { name } = fileGroup
-    orderedStats[name] = stats[name]
+  // Collect file sizes only when not in benchmark-only mode
+  if (collectFileSizes) {
+    for (const fileGroup of runConfig.filesToTrack) {
+      const {
+        getRequiredFiles = defaultGetRequiredFiles,
+        name,
+        globs,
+      } = fileGroup
+      const groupStats = {}
+      const curFiles = new Set()
+
+      for (const pattern of globs) {
+        const results = await glob(pattern, { cwd: curDir, nodir: true })
+        results.forEach((result) => curFiles.add(result))
+      }
+
+      for (const file of curFiles) {
+        const fileKey = path.basename(file)
+        try {
+          let parsedSizeSum = 0
+          let gzipSizeSum = 0
+          for (const requiredFile of await getRequiredFiles(curDir, file)) {
+            const absPath = path.join(curDir, requiredFile)
+            const fileInfo = await fs.stat(absPath)
+            parsedSizeSum += fileInfo.size
+            gzipSizeSum += await gzipSize.file(absPath)
+          }
+          groupStats[fileKey] = parsedSizeSum
+          groupStats[`${fileKey} gzip`] = gzipSizeSum
+        } catch (err) {
+          logger.error('Failed to get file stats', err)
+        }
+      }
+      stats[name] = groupStats
+    }
+
+    for (const fileGroup of runConfig.filesToTrack) {
+      const { name } = fileGroup
+      orderedStats[name] = stats[name]
+    }
   }
 
   if (stats[benchTitle]) {
