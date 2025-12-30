@@ -60,6 +60,7 @@ export type NextDevOptions = {
   experimentalHttpsCa?: string
   experimentalUploadTrace?: string
   experimentalNextConfigStripTypes?: boolean
+  experimentalCpuProf?: boolean
 }
 
 type PortSource = 'cli' | 'default' | 'env'
@@ -187,6 +188,12 @@ const nextDev = async (
   // Check if pages dir exists and warn if not
   if (!(await fileExists(dir, FileType.Directory))) {
     printAndExit(`> No such directory exists as the project root: ${dir}`)
+  }
+
+  if (options.experimentalCpuProf) {
+    Log.info(
+      `CPU profiling enabled. Profile will be saved to .next/cpu-profiles/ on exit (Ctrl+C).`
+    )
   }
 
   async function preflight(skipOnReboot: boolean) {
@@ -318,6 +325,14 @@ const nextDev = async (
           // https://github.com/nodejs/node/issues/29949
           WATCHPACK_WATCHER_LIMIT:
             os.platform() === 'darwin' ? '20' : undefined,
+          // Enable CPU profiling if requested
+          ...(options.experimentalCpuProf
+            ? {
+                NEXT_CPU_PROF: '1',
+                NEXT_CPU_PROF_DIR: path.join(dir, '.next', 'cpu-profiles'),
+                __NEXT_PRIVATE_CPU_PROFILE: 'dev-server',
+              }
+            : undefined),
         },
       })
 

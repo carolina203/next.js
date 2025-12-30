@@ -8,12 +8,14 @@ import {
   getReservedPortExplanation,
   isPortIsReserved,
 } from '../lib/helpers/get-reserved-port'
+import * as Log from '../build/output/log'
 
 export type NextStartOptions = {
   port: number
   hostname?: string
   keepAliveTimeout?: number
   experimentalNextConfigStripTypes?: boolean
+  experimentalCpuProf?: boolean
 }
 
 /**
@@ -30,6 +32,10 @@ const nextStart = async (options: NextStartOptions, directory?: string) => {
 
   if (isPortIsReserved(port)) {
     printAndExit(getReservedPortExplanation(port), 1)
+  }
+
+  if (options.experimentalCpuProf) {
+    Log.info(`CPU profiling enabled. Profile will be saved on exit (Ctrl+C).`)
   }
 
   await startServer({

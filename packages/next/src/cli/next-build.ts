@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import '../server/lib/cpu-profile'
+import { saveCpuProfile } from '../server/lib/cpu-profile'
 import { existsSync } from 'fs'
 import { italic } from '../lib/picocolors'
 import build from '../build'
@@ -32,6 +32,7 @@ export type NextBuildOptions = {
   experimentalUploadTrace?: string
   experimentalNextConfigStripTypes?: boolean
   debugBuildPaths?: string
+  experimentalCpuProf?: boolean
 }
 
 const nextBuild = async (options: NextBuildOptions, directory?: string) => {
@@ -157,4 +158,4 @@ const nextBuild = async (options: NextBuildOptions, directory?: string) => {
     })
 }
 
-export { nextBuild }
+export { nextBuild, saveCpuProfile }
